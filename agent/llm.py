@@ -1,6 +1,4 @@
 from google import genai
-
-# masukkan API key Gemini kamu
 client = genai.Client(api_key="AIzaSyA2VA3tVdKjx8y-eoOcfUyNEApHr2hwjeI")
 
 def ask_gemini(user_msg: str) -> str:
