@@ -1,274 +1,215 @@
+# agent/router.py (kode lengkap dan diperbaiki)
+import pandas as pd
+from sqlalchemy import create_engine, text
 from agent.llm import ask_gemini
 from model.calculator import MiningValueCalculator
 from model.rules import apply_general_rules
 import datetime
 import json
+import pickle
+import os
+import uuid
 
 class ChatRouter:
-
-    def __init__(self, df_path, model_path):
-        self.calculator = MiningValueCalculator(df_path=df_path, model_path=model_path)
-
+    def __init__(self, df_path, model_paths):
+        # Jika df_path='dummy', skip DB load untuk test
+        if df_path == 'dummy':
+            self.conn = None
+            self.mining_calculator = MiningValueCalculator(df_path=None, model_path=None)
+            self.shipping_model = None
+            return
+        
+        # Setup DB dengan SQLAlchemy
+        from config import DB_CONFIG
+        db_uri = f"postgresql://{DB_CONFIG['user']}:{DB_CONFIG['password']}@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['database']}"
+        self.engine = create_engine(db_uri)
+        
+        # Load data mining_clean2 dari DB
+        if df_path is None:
+            query = "SELECT * FROM mining_clean2;"
+            mining_df = pd.read_sql_query(query, self.engine)
+        else:
+            mining_df = pd.read_csv(df_path)
+        
+        # Setup model paths
+        if model_paths is None:
+            self.model_paths = None
+            self.mining_calculator = MiningValueCalculator(df=mining_df, model_path=None)
+            self.shipping_model = None
+        else:
+            self.model_paths = model_paths
+            # Load mining model
+            mining_model_path = self.model_paths.get('mining')
+            self.mining_calculator = MiningValueCalculator(df=mining_df, model_path=mining_model_path)
+            
+            # Load shipping model
+            shipping_model_path = self.model_paths.get('shipping')
+            if shipping_model_path and os.path.exists(shipping_model_path):
+                try:
+                    with open(shipping_model_path, 'rb') as f:
+                        self.shipping_model = pickle.load(f)
+                except Exception as e:
+                    print(f"Warning: Shipping model gagal load ({str(e)}). Menggunakan rule-based.")
+                    self.shipping_model = None
+            else:
+                self.shipping_model = None
+        
+        # Hitung delay_hours untuk shipping jika ada data
+        if 'arrival_estimate' in mining_df.columns and 'departure_date' in mining_df.columns:
+            mining_df["delay_hours"] = (
+                (pd.to_datetime(mining_df["arrival_estimate"]) - pd.to_datetime(mining_df["departure_date"]))
+                .dt.total_seconds() / 3600
+            ).clip(lower=0).fillna(0)
+        
+        self.shipping_features = [
+            "distance", "cargo_volume_ton", "capacity_ton", "rainfall_mm", 
+            "wind_speed_kmh", "wave_height_m", "temperature_c", "humidity_percent"
+        ]
+    
+    
     def is_simulation_request(self, message: str) -> bool:
-        """
-        Deteksi apakah user ingin menjalankan simulasi ML.
-        Contoh trigger:
-        - "simulasi"
-        - "prediksi"
-        - "minggu depan"
-        - "target"
-        """
-        keywords = ["simulasi", "prediksi", "produksi", "minggu", "target", "kapasitas"]
+        keywords = ["simulasi", "prediksi", "produksi", "minggu", "target", "kapasitas", "delay"]
         return any(k in message.lower() for k in keywords)
-
+    
     def is_weather_related(self, message: str) -> bool:
-        """
-        Deteksi apakah pertanyaan berkaitan dengan cuaca (misalnya hujan).
-        """
         weather_keywords = ["hujan", "cuaca", "rain", "weather", "besok", "hari ini"]
-        return any(k in message.lower() for k in weather_keywords)
-
+        return any(k in message.lower() for k in message.lower())
+    
     def is_production_target_related(self, message: str) -> bool:
-        """
-        Deteksi apakah pertanyaan berkaitan dengan target produksi.
-        """
         target_keywords = ["target", "ton", "produksi", "hasil", "output"]
         return any(k in message.lower() for k in target_keywords)
-
+    
     def is_capacity_related(self, message: str) -> bool:
-        """
-        Deteksi apakah pertanyaan berkaitan dengan kapasitas unit.
-        """
         capacity_keywords = ["kapasitas", "unit", "mesin", "alat"]
         return any(k in message.lower() for k in capacity_keywords)
-
+    
     def is_efficiency_related(self, message: str) -> bool:
-        """
-        Deteksi apakah pertanyaan berkaitan dengan efisiensi.
-        """
         efficiency_keywords = ["efisiensi", "persentase", "rate", "tingkat"]
         return any(k in message.lower() for k in efficiency_keywords)
-
+    
     def is_weekly_prediction_related(self, message: str) -> bool:
-        """
-        Deteksi apakah pertanyaan berkaitan dengan prediksi mingguan.
-        """
         weekly_keywords = ["minggu", "weekly", "minggu depan", "prediksi minggu"]
         return any(k in message.lower() for k in weekly_keywords)
-
+    
+    def is_shipping_related(self, message: str) -> bool:
+        shipping_keywords = ["kapal", "vessel", "shipping", "delay", "arrival", "departure"]
+        return any(k in message.lower() for k in shipping_keywords)
+    
     def parse_simulation_input(self, message: str):
-        """
-        Ekstraksi target ton dan week_start dari pertanyaan user.
-        Format bebas, tapi minimal:
-        - angka → target ton
-        - tanggal → week_start
-        """
-
         import re
-
-        # Ambil angka → target ton
         ton_match = re.findall(r"\d+", message)
         target_ton = float(ton_match[0]) if ton_match else 10000.0
-
-        # Cari tanggal (YYYY-MM-DD)
         date_match = re.findall(r"\d{4}-\d{2}-\d{2}", message)
-        if date_match:
-            week_start = datetime.datetime.strptime(date_match[0], "%Y-%m-%d")
-        else:
-            week_start = datetime.datetime.today()
-
+        week_start = datetime.datetime.strptime(date_match[0], "%Y-%m-%d") if date_match else datetime.datetime.today()
         return target_ton, week_start
-
-    def format_simulation_for_llm(self, sim_result: dict, user_msg: str) -> str:
-        """
-        Format hasil simulasi menjadi prompt untuk Gemini agar menghasilkan
-        jawaban yang natural seperti manusia. Prompt dibuat lebih rinci dan bisa dipisah-pisah
-        berdasarkan jenis pertanyaan (cuaca, target produksi, kapasitas, efisiensi, prediksi mingguan, dll.).
-        """
-        
-        # Ambil data dengan safe get
+    
+    def format_simulation_for_llm(self, sim_result: dict, user_msg: str, sim_type: str) -> str:
         input_feat = sim_result.get("input_features", {})
         predictions = sim_result.get("predictions", {})
-        recommendations = sim_result.get("recommendations", [])
         
-        # Jika struktur berbeda, coba ambil dari key lain
-        if not predictions and "prediction" in sim_result:
-            predictions = sim_result["prediction"]
-        
-        # Ekstrak nilai-nilai dengan aman
-        target_ton = input_feat.get('target_ton', 'N/A')
-        week_start = input_feat.get('week_start', 'N/A')
-        unit_capacity = input_feat.get('unit_capacity', 'N/A')
-        num_units = input_feat.get('num_units', 'N/A')
-        operating_hours = input_feat.get('operating_hours', 'N/A')
-        efficiency = input_feat.get('efficiency', 'N/A')
-        
-        # Ambil prediksi
-        if isinstance(predictions, dict):
-            predicted_production = predictions.get('predicted_production', predictions.get('production', 'N/A'))
-            success_rate = predictions.get('success_rate', predictions.get('rate', 'N/A'))
-            status = predictions.get('status', 'N/A')
+        if sim_type == "shipping":
+            predicted_value = sim_result.get("predicted_delay_hours", "N/A")
+            data_prompt = f"HASIL PREDIKSI SHIPPING: Prediksi Delay Hours: {predicted_value} jam. INPUT: {json.dumps(input_feat, indent=2, default=str)}"
         else:
-            predicted_production = predictions if predictions else 'N/A'
-            success_rate = 'N/A'
-            status = 'N/A'
+            target_ton = input_feat.get('target_ton', 'N/A')
+            predicted_production = predictions.get('predicted_production', 'N/A')
+            data_prompt = f"HASIL PREDIKSI MINING: Target Produksi: {target_ton} ton, Produksi Diprediksi: {predicted_production} ton. INPUT: {json.dumps(input_feat, indent=2, default=str)}"
         
-        # Format rekomendasi
-        rec_text = "\n".join(f"- {rec}" for rec in recommendations) if recommendations else "Tidak ada rekomendasi khusus"
-        
-        # Deteksi jenis pertanyaan untuk menyesuaikan prompt
-        is_weather = self.is_weather_related(user_msg)
-        is_target = self.is_production_target_related(user_msg)
-        is_capacity = self.is_capacity_related(user_msg)
-        is_efficiency = self.is_efficiency_related(user_msg)
-        is_weekly = self.is_weekly_prediction_related(user_msg)
-        
-        # Bagian prompt dasar (bisa dipisah-pisah)
-        intro_prompt = f"""
-Anda adalah asisten ahli pertambangan yang ramah dan profesional. 
-Berdasarkan pertanyaan user: "{user_msg}"
-"""
-        
-        data_prompt = f"""
-Berikut hasil analisis simulasi produksi:
+        intro_prompt = f"Anda adalah asisten ahli. Pertanyaan: '{user_msg}'"
+        task_prompt = "Jelaskan hasil dengan bahasa natural, fokus pada yang ditanyakan."
+        return intro_prompt + data_prompt + task_prompt
+    
+    def get_user_info(self, user_id):
+        # Cast user_id ke UUID jika perlu, atau asumsikan input sudah UUID string
+        query = text("SELECT user_id, username FROM users WHERE user_id = :user_id;")
+        with self.engine.connect() as conn:
+            result = conn.execute(query, {"user_id": user_id}).fetchone()
+        return dict(result._mapping) if result else None
+    
+    def get_recent_chat_history(self, user_id, hours=24):
+        since_time = datetime.datetime.now() - datetime.timedelta(hours=hours)
+        query = text("""
+        SELECT message, answer, created_at 
+        FROM chat_history 
+        WHERE user_id = :user_id AND created_at >= :since_time 
+        ORDER BY created_at DESC;
+        """)
+        with self.engine.connect() as conn:
+            results = conn.execute(query, {"user_id": user_id, "since_time": since_time}).fetchall()
+        return [dict(row._mapping) for row in results] if results else None
 
-INPUT PARAMETER:
-- Target Produksi: {target_ton} ton
-- Minggu Mulai: {week_start}
-- Kapasitas Unit: {unit_capacity}
-- Jumlah Unit: {num_units}
-- Jam Operasi: {operating_hours} jam
-- Efisiensi: {efficiency}%
-
-HASIL PREDIKSI:
-- Produksi yang Diprediksi: {predicted_production} ton
-- Tingkat Keberhasilan: {success_rate}%
-- Status: {status}
-
-REKOMENDASI:
-{rec_text}
-
-DATA LENGKAP (untuk referensi):
-{json.dumps(sim_result, indent=2, default=str)}
-"""
+    
+    def save_chat_history(self, user_id, message, answer, chat_id=None):
+        if chat_id is None:
+            chat_id = str(uuid.uuid4())
+        query = text("""
+        INSERT INTO chat_history (user_id, message, answer, chat_id) 
+        VALUES (:user_id, :message, :answer, :chat_id);
+        """)
+        with self.engine.connect() as conn:
+            conn.execute(query, {"user_id": user_id, "message": message, "answer": answer, "chat_id": chat_id})
+            conn.commit()
+    
+    def predict_shipping_delay(self, input_data: dict) -> dict:
+        if self.shipping_model is None:
+            return {"predicted_delay_hours": 0.0, "input_features": input_data}
+        X_input = pd.DataFrame([input_data])[self.shipping_features].fillna(pd.Series(input_data).median())
+        prediction = float(self.shipping_model.predict(X_input)[0])
+        return {"predicted_delay_hours": prediction, "input_features": input_data}
+    
+    def handle_message(self, user_msg: str, user_id: str):
+        user_info = self.get_user_info(user_id)
+        if not user_info:
+            return {"type": "error", "answer": "User tidak ditemukan."}
         
-        # Sesuaikan task_prompt berdasarkan jenis pertanyaan
-        if is_weather:
-            task_prompt = f"""
-TUGAS ANDA:
-Pertanyaan user berkaitan dengan cuaca (seperti hujan). Jawab hanya mengenai prediksi produksi besok yang berkaitan dengan hujan dan alasannya.
-- Jelaskan apakah hujan akan menghambat produksi besok berdasarkan data simulasi.
-- Berikan alasan konkret, seperti dampak pada efisiensi, jam operasi, atau rekomendasi terkait cuaca.
-- Jangan jelaskan semua input parameter atau hasil simulasi secara keseluruhan; fokus hanya pada aspek cuaca dan produksi besok.
-- Gunakan bahasa natural, mudah dipahami, dan profesional, seperti sedang berbicara langsung dengan user.
-- Berikan insight yang berguna dan saran actionable terkait cuaca.
-"""
-        elif is_target:
-            task_prompt = f"""
-TUGAS ANDA:
-Pertanyaan user berkaitan dengan target produksi. Jawab hanya mengenai pencapaian target produksi dan alasannya.
-- Jelaskan apakah target produksi dapat dicapai berdasarkan prediksi, termasuk produksi yang diprediksi dan tingkat keberhasilan.
-- Berikan alasan konkret, seperti kapasitas unit, jam operasi, atau rekomendasi terkait target.
-- Jangan jelaskan semua input parameter atau hasil simulasi secara keseluruhan; fokus hanya pada aspek target produksi.
-- Gunakan bahasa natural, mudah dipahami, dan profesional, seperti sedang berbicara langsung dengan user.
-- Berikan insight yang berguna dan saran actionable terkait target produksi.
-"""
-        elif is_capacity:
-            task_prompt = f"""
-TUGAS ANDA:
-Pertanyaan user berkaitan dengan kapasitas unit. Jawab hanya mengenai kapasitas unit dan dampaknya pada produksi.
-- Jelaskan bagaimana kapasitas unit mempengaruhi produksi, termasuk jumlah unit dan jam operasi.
-- Berikan alasan konkret berdasarkan data simulasi, seperti produksi yang diprediksi.
-- Jangan jelaskan semua input parameter atau hasil simulasi secara keseluruhan; fokus hanya pada aspek kapasitas.
-- Gunakan bahasa natural, mudah dipahami, dan profesional, seperti sedang berbicara langsung dengan user.
-- Berikan insight yang berguna dan saran actionable terkait kapasitas unit.
-"""
-        elif is_efficiency:
-            task_prompt = f"""
-TUGAS ANDA:
-Pertanyaan user berkaitan dengan efisiensi. Jawab hanya mengenai tingkat efisiensi dan dampaknya pada produksi.
-- Jelaskan bagaimana efisiensi mempengaruhi produksi, termasuk persentase efisiensi dan tingkat keberhasilan.
-- Berikan alasan konkret berdasarkan data simulasi, seperti rekomendasi terkait efisiensi.
-- Jangan jelaskan semua input parameter atau hasil simulasi secara keseluruhan; fokus hanya pada aspek efisiensi.
-- Gunakan bahasa natural, mudah dipahami, dan profesional, seperti sedang berbicara langsung dengan user.
-- Berikan insight yang berguna dan saran actionable terkait efisiensi.
-"""
-        elif is_weekly:
-            task_prompt = f"""
-TUGAS ANDA:
-Pertanyaan user berkaitan dengan prediksi mingguan. Jawab hanya mengenai prediksi produksi untuk minggu tersebut dan alasannya.
-- Jelaskan produksi yang diprediksi untuk minggu mulai, termasuk status dan rekomendasi.
-- Berikan alasan konkret, seperti target ton, kapasitas, atau jam operasi.
-- Jangan jelaskan semua input parameter atau hasil simulasi secara keseluruhan; fokus hanya pada aspek prediksi mingguan.
-- Gunakan bahasa natural, mudah dipahami, dan profesional, seperti sedang berbicara langsung dengan user.
-- Berikan insight yang berguna dan saran actionable terkait prediksi mingguan.
-"""
-        else:
-            # Prompt umum untuk simulasi lainnya
-            task_prompt = f"""
-TUGAS ANDA:
-Jelaskan hasil simulasi ini dengan bahasa yang natural, mudah dipahami, dan profesional.
-Berikan insight yang berguna dan saran yang actionable.
-Jangan gunakan format bullet point atau terlalu formal.
-Buatlah seperti Anda sedang berbicara langsung dengan user.
-Gunakan angka-angka dari data di atas untuk memberikan penjelasan yang konkret.
-Berikan penjelasan yang to the point mengenai apa yang ditanyakan oleh user, jangan terlalu banyak membahas diluar yang ditanyakan user.
-"""
+        recent_chats = self.get_recent_chat_history(user_id)
+        greeting = f"Hai {user_info['username']}! " if not recent_chats else ""
         
-        # Gabungkan prompt (bisa dipisah-pisah jika diperlukan)
-        full_prompt = intro_prompt + data_prompt + task_prompt
-        
-        return full_prompt
-
-    def handle_message(self, user_msg: str):
-        """
-        Router utama untuk chatbox.
-        """
-
-        # 1. Cek apakah user minta simulasi
         if self.is_simulation_request(user_msg):
             try:
-                target_ton, week_start = self.parse_simulation_input(user_msg)
-
-                sim = self.calculator.calculate_optimal_value(
-                    target_ton=target_ton,
-                    week_start=week_start
-                )
-
-                # Tambahkan rules tambahan
-                extra_rules = apply_general_rules(sim["input_features"])
+                if self.is_shipping_related(user_msg):
+                    target_ton, week_start = self.parse_simulation_input(user_msg)
+                    input_data = {
+                        "distance": 100.0,
+                        "cargo_volume_ton": target_ton,
+                        "capacity_ton": 5000.0,
+                        "rainfall_mm": 0.0,
+                        "wind_speed_kmh": 10.0,
+                        "wave_height_m": 1.0,
+                        "temperature_c": 25.0,
+                        "humidity_percent": 60.0
+                    }
+                    sim = self.predict_shipping_delay(input_data)
+                    sim_type = "shipping"
+                else:
+                    target_ton, week_start = self.parse_simulation_input(user_msg)
+                    sim = self.mining_calculator.calculate_optimal_value(target_ton=target_ton, week_start=week_start)
+                    sim_type = "mining"
                 
-                # Pastikan recommendations adalah list
-                if "recommendations" not in sim:
-                    sim["recommendations"] = []
-                elif not isinstance(sim["recommendations"], list):
-                    sim["recommendations"] = [sim["recommendations"]]
-                    
-                sim["recommendations"].extend(extra_rules)
-
-                # PROSES HASIL SIMULASI DENGAN GEMINI
-                llm_prompt = self.format_simulation_for_llm(sim, user_msg)
+                llm_prompt = self.format_simulation_for_llm(sim, user_msg, sim_type)
                 natural_answer = ask_gemini(llm_prompt)
-
+                self.save_chat_history(user_id, user_msg, natural_answer)
                 return {
                     "type": "simulation",
-                    "result": sim,  # Data mentah tetap disimpan
-                    "answer": natural_answer  # Jawaban natural dari Gemini
+                    "result": sim,
+                    "answer": greeting + natural_answer
                 }
             
             except Exception as e:
-                # Jika ada error, fallback ke LLM biasa
-                error_msg = f"Maaf, terjadi error saat simulasi: {str(e)}. Silakan coba lagi atau tanyakan hal lain."
-                return {
-                    "type": "error",
-                    "answer": error_msg,
-                    "error_details": str(e)
-                }
-
-        # 2. Jika bukan simulasi → lempar ke Gemini
+                error_msg = f"Error simulasi: {str(e)}"
+                self.save_chat_history(user_id, user_msg, error_msg)
+                return {"type": "error", "answer": greeting + error_msg}
+        
         else:
-            answer = ask_gemini(user_msg)
-            return {
-                "type": "llm",
-                "answer": answer
-            }
+            if recent_chats:
+                history_context = "\n".join([f"User: {c['message']}\nBot: {c['answer']}" for c in recent_chats])
+                full_prompt = f"Konteks: {history_context}\nPertanyaan: {user_msg}"
+                answer = ask_gemini(full_prompt)
+            else:
+                answer = ask_gemini(user_msg)
+            self.save_chat_history(user_id, user_msg, answer)
+            return {"type": "llm", "answer": greeting + answer}
+    
+    def close_connection(self):
+        if hasattr(self, 'engine') and self.engine:
+            self.engine.dispose()

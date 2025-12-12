@@ -30,10 +30,11 @@ except Exception as e:
 
 def ask_gemini(user_msg: str) -> str:
     try:
-        model = genai.GenerativeModel("gemini-2.5-pro")
+        model = genai.GenerativeModel("gemini-2.5-flash") 
+        
         response = model.generate_content(user_msg)
         logging.info(f"Gemini response: {response.text.strip()}")
         return response.text.strip()
     except Exception as e:
-        logging.error(f"Error in get_gemini_response(): {e}")
+        logging.error(f"Error in ask_gemini(): {e}")
         return "Sorry, I couldn't process that."
